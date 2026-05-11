@@ -129,18 +129,25 @@ def main():
 
     opt = AdamW([p for p in model.parameters() if p.requires_grad],
                 lr=args.lr, betas=(0.9, 0.95), weight_decay=0.0, eps=1e-8, fused=True)
-    # Compute total optimizer steps after accelerate prepare (which adds DistributedSampler)
     model, opt, dl = accelerator.prepare(model, opt, dl)
     steps_per_epoch = max(1, len(dl) // args.grad_accum)
-    total_steps = steps_per_epoch * args.epochs
-    sched = get_cosine_schedule_with_warmup(opt, num_warmup_steps=max(1, total_steps // 20),
+    total_opt_steps = steps_per_epoch * args.epochs
+    # AcceleratedScheduler advances the underlying scheduler num_processes times per
+    # sched.step() call (split_batches=False, step_with_optimizer=True). Pre-multiply
+    # total_steps to match — otherwise the cosine overshoots and bounces back up to peak.
+    total_steps = total_opt_steps * accelerator.num_processes
+    warmup = max(1, total_steps // 20)
+    sched = get_cosine_schedule_with_warmup(opt, num_warmup_steps=warmup,
                                             num_training_steps=total_steps)
     sched = accelerator.prepare(sched)
+    if accelerator.is_main_process:
+        print(f"LR schedule: {total_opt_steps} opt steps × {accelerator.num_processes} procs "
+              f"= {total_steps} underlying steps (warmup={warmup})", flush=True)
     model.train()
 
     t0 = time.time()
     step, accum_loss, accum_n = 0, 0.0, 0
-    losses = []
+    losses, lrs = [], []
     for ep in range(args.epochs):
         for batch in dl:
             with accelerator.accumulate(model):
@@ -160,9 +167,10 @@ def main():
                     step += 1
                     if step % args.log_every == 0:
                         avg = accum_loss / max(1, accum_n)
-                        losses.append(avg)
+                        lr_now = float(sched.get_last_lr()[0])
+                        losses.append(avg); lrs.append(lr_now)
                         if accelerator.is_main_process:
-                            print(f"[{args.mode}] ep{ep} step {step}/{total_steps} loss={avg:.4f} lr={sched.get_last_lr()[0]:.2e} t={int(time.time()-t0)}s", flush=True)
+                            print(f"[{args.mode}] ep{ep} step {step}/{total_opt_steps} loss={avg:.4f} lr={lr_now:.2e} t={int(time.time()-t0)}s", flush=True)
                         accum_loss, accum_n = 0.0, 0
         if accelerator.is_main_process:
             print(f"[{args.mode}] epoch {ep+1}/{args.epochs} done in {int(time.time()-t0)}s", flush=True)
@@ -175,9 +183,11 @@ def main():
         unwrap.save_pretrained(args.out)
         tok.save_pretrained(args.out)
         with open(os.path.join(args.out, "train_log.json"), "w") as f:
-            json.dump({"losses": losses, "wallclock_s": int(time.time()-t0),
+            json.dump({"losses": losses, "lrs": lrs, "wallclock_s": int(time.time()-t0),
                        "n_examples": len(rows), "epochs": args.epochs, "mode": args.mode,
-                       "lora_rank": args.lora_rank}, f, indent=2)
+                       "lora_rank": args.lora_rank,
+                       "total_opt_steps": total_opt_steps,
+                       "num_processes": accelerator.num_processes}, f, indent=2)
         print(f"[{args.mode}] saved to {args.out} in {int(time.time()-t0)}s", flush=True)
 
 

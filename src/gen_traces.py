@@ -1,14 +1,22 @@
-"""Generate on-policy abstract traces from a single-GPU loaded model.
+"""Generate on-policy abstract traces with vLLM.
 
-Used between training phases (no DeepSpeed/ZeRO complications).
+Replaces the previous single-GPU HF `model.generate()` path. Uses vLLM's
+`allowed_token_ids` SamplingParams field to enforce the V_abs ∪ {END_ABS}
+alphabet directly in the sampler — no custom LogitsProcessor needed.
+
+The prompt always ends with `<beginabstract>`, so the *first* generated token
+onward is constrained to V_abs ∪ {END_ABS}. Generation terminates when
+`<endabstract>` is sampled (via `stop_token_ids`) or when `m_max` tokens have
+been produced (via `max_tokens`).
 """
 from __future__ import annotations
 import argparse, json, random, time
 from pathlib import Path
-import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer, LogitsProcessorList
 
-from abstract import BEGIN_ABS, END_ABS, abstract_token_strings, AbstractConstrainedLogits
+from vllm import LLM, SamplingParams
+from transformers import AutoTokenizer
+
+from abstract import BEGIN_ABS, END_ABS, abstract_token_strings
 from data_utils import encode_user_prefix, load_jsonl
 
 
@@ -17,95 +25,103 @@ def main():
     ap.add_argument("--base", required=True, help="Trained model dir")
     ap.add_argument("--data", default="/workspace/data/dolci_5k.jsonl")
     ap.add_argument("--n", type=int, default=5000)
-    ap.add_argument("--use-cot", action="store_true", help="If set, condition on x+c (for bottleneck t>=2). Else x only (distill).")
+    ap.add_argument("--use-cot", action="store_true",
+                    help="If set, condition on x+c (for bottleneck t>=2). Else x only (distill).")
     ap.add_argument("--m-max", type=int, default=128)
-    ap.add_argument("--batch", type=int, default=16)
     ap.add_argument("--max-prefix-len", type=int, default=1024)
+    ap.add_argument("--tp", type=int, default=2, help="vLLM tensor_parallel_size")
+    ap.add_argument("--temperature", type=float, default=1.0)
+    ap.add_argument("--top-p", type=float, default=1.0)
+    ap.add_argument("--max-model-len", type=int, default=4096,
+                    help="vLLM max model length; must accommodate prefix + m_max")
+    ap.add_argument("--gpu-mem-util", type=float, default=0.85)
     ap.add_argument("--out", required=True)
     ap.add_argument("--seed", type=int, default=42)
     args = ap.parse_args()
-    random.seed(args.seed); torch.manual_seed(args.seed)
+    random.seed(args.seed)
 
+    # Tokenizer for prompt construction (vLLM owns its own copy internally).
     tok = AutoTokenizer.from_pretrained(args.base, trust_remote_code=True)
-    if tok.pad_token_id is None: tok.pad_token = tok.eos_token
+    if tok.pad_token_id is None:
+        tok.pad_token = tok.eos_token
     abs_token_ids = tok.convert_tokens_to_ids(abstract_token_strings(64))
     begin_id = tok.convert_tokens_to_ids(BEGIN_ABS)
     end_id = tok.convert_tokens_to_ids(END_ABS)
+    allowed_ids = [int(t) for t in abs_token_ids] + [int(end_id)]
+    abs_set = set(int(x) for x in abs_token_ids)
 
-    model = AutoModelForCausalLM.from_pretrained(
-        args.base, dtype=torch.bfloat16, trust_remote_code=True, attn_implementation="sdpa", device_map="cuda:0",
+    print(f"loading vLLM: base={args.base}  tp={args.tp}  max_model_len={args.max_model_len}")
+    llm = LLM(
+        model=args.base,
+        tensor_parallel_size=args.tp,
+        dtype="bfloat16",
+        trust_remote_code=True,
+        max_model_len=args.max_model_len,
+        gpu_memory_utilization=args.gpu_mem_util,
+        enforce_eager=False,
     )
-    model.eval()
 
     rows = load_jsonl(args.data)[: args.n]
-    proc = AbstractConstrainedLogits(abs_token_ids=abs_token_ids, end_id=end_id, m_max=args.m_max, begin_id=begin_id)
-    plist = LogitsProcessorList([proc])
+    print(f"building {len(rows)} prompts  use_cot={args.use_cot}")
 
-    # Build prompts
     prompts = []
     for r in rows:
         X = encode_user_prefix(tok, r["prompt"])
-        if args.use_cot:
-            C = tok(r["cot"], add_special_tokens=False).input_ids
-        else:
-            C = []
+        C = tok(r["cot"], add_special_tokens=False).input_ids if args.use_cot else []
         prefix = X + C + [begin_id]
         if len(prefix) > args.max_prefix_len:
-            keep = args.max_prefix_len - len(X) - 1
-            C = C[:max(0, keep)]
+            # Prefer truncating C from the right; if X alone overflows (long Dolci prompts),
+            # keep the tail of X so the question stays intact.
+            keep_for_C = args.max_prefix_len - len(X) - 1
+            if keep_for_C >= 0:
+                C = C[: keep_for_C]
+            else:
+                C = []
+                X = X[-(args.max_prefix_len - 1):]
             prefix = X + C + [begin_id]
-        prompts.append(prefix)
+        prompts.append({"prompt_token_ids": prefix})
 
-    # Order by length, batch
-    abs_set = set(int(x) for x in abs_token_ids)
-    order = sorted(range(len(prompts)), key=lambda i: len(prompts[i]))
-    out_traces = [None] * len(prompts)
+    sampling = SamplingParams(
+        n=1,
+        temperature=args.temperature,
+        top_p=args.top_p,
+        max_tokens=args.m_max,
+        stop_token_ids=[int(end_id)],
+        allowed_token_ids=allowed_ids,
+        skip_special_tokens=False,
+        detokenize=False,
+        seed=args.seed,
+    )
 
-    pad_id = tok.pad_token_id
     t0 = time.time()
-    i = 0
-    while i < len(order):
-        chunk_idx = order[i:i + args.batch]
-        chunk = [prompts[j] for j in chunk_idx]
-        L = max(len(p) for p in chunk)
-        ids = torch.full((len(chunk), L), pad_id, dtype=torch.long, device="cuda:0")
-        attn = torch.zeros((len(chunk), L), dtype=torch.long, device="cuda:0")
-        for k, p in enumerate(chunk):
-            ids[k, L - len(p):] = torch.tensor(p, dtype=torch.long)
-            attn[k, L - len(p):] = 1
-        with torch.no_grad():
-            gen = model.generate(
-                input_ids=ids, attention_mask=attn,
-                do_sample=True, temperature=1.0, top_p=1.0,
-                max_new_tokens=args.m_max + 2,
-                pad_token_id=pad_id, eos_token_id=end_id,
-                logits_processor=plist,
-            )
-        for k, j in enumerate(chunk_idx):
-            new = gen[k, L:].tolist()
-            if end_id in new:
-                new = new[: new.index(end_id)]
-            trace = [t for t in new if t in abs_set]
-            if not trace:
-                trace = [random.choice(abs_token_ids) for _ in range(8)]
-            out_traces[j] = trace
-        i += args.batch
-        if (i // args.batch) % 20 == 0:
-            done = min(i, len(order))
-            rate = done / max(1, int(time.time()-t0))
-            print(f"  gen: {done}/{len(prompts)}  rate={rate:.1f}/s  elapsed={int(time.time()-t0)}s")
+    outputs = llm.generate(prompts=prompts, sampling_params=sampling, use_tqdm=True)
+    dt = int(time.time() - t0)
 
-    # Save in original row order
+    # Parse outputs, write in original row order.
+    out_traces = []
+    for out in outputs:
+        gen = list(out.outputs[0].token_ids)
+        # stop_token_ids may include the stop token in output; strip it
+        if end_id in gen:
+            gen = gen[: gen.index(end_id)]
+        trace = [t for t in gen if t in abs_set]
+        if not trace:
+            # Fallback: random short trace so downstream training never sees empty.
+            trace = [random.choice(abs_token_ids) for _ in range(8)]
+        out_traces.append(trace)
+
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
+    lens = []
     with open(args.out, "w") as f:
-        lens = []
         for trace in out_traces:
             f.write(json.dumps({"trace": trace}) + "\n")
             lens.append(len(trace))
     lens.sort()
     n = len(lens)
-    print(f"DONE wrote {n} traces to {args.out}  t={int(time.time()-t0)}s")
-    print(f"  trace lens: mean={sum(lens)/n:.1f}  median={lens[n//2]}  p10={lens[n//10]}  p90={lens[int(0.9*n)]}  max={max(lens)}")
+    rate = n / max(1, dt)
+    print(f"DONE wrote {n} traces to {args.out}  t={dt}s  rate={rate:.1f}/s")
+    print(f"  trace lens: mean={sum(lens)/n:.1f}  median={lens[n//2]}  "
+          f"p10={lens[n//10]}  p90={lens[int(0.9*n)]}  max={max(lens)}")
 
 
 if __name__ == "__main__":

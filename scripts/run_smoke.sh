@@ -19,6 +19,8 @@ cd "$REPO"
 : "${RUNS_DIR:=$REPO/runs}"
 : "${DATA_DIR:=$REPO/data}"
 : "${HF_HOME:=$REPO/cache}"
+: "${DATA_FILE:=$DATA_DIR/dolci_${N}.jsonl}"   # override to share one download across N's
+: "${SKIP_BASELINE:=0}"
 : "${CUDA_VISIBLE_DEVICES:=$(bash scripts/check_gpus.sh)}"
 export HF_HOME CUDA_VISIBLE_DEVICES
 
@@ -29,11 +31,11 @@ fi
 echo ">> Using GPUs: $CUDA_VISIBLE_DEVICES"
 
 # --- 1. Download data if missing ---
-if [[ ! -f "$DATA_DIR/math500.jsonl" ]] || [[ ! -f "$DATA_DIR/dolci_${N}.jsonl" ]]; then
+if [[ ! -f "$DATA_DIR/math500.jsonl" ]] || [[ ! -f "$DATA_FILE" ]]; then
   echo ">> Downloading data..."
   python3 scripts/download_data.py \
     --math500-out "$DATA_DIR/math500.jsonl" \
-    --dolci-out "$DATA_DIR/dolci_${N}.jsonl" \
+    --dolci-out "$DATA_FILE" \
     --n "$N"
 fi
 
@@ -46,7 +48,7 @@ if [[ ! -f "$BASE_EXT/abstract_vocab.json" ]]; then
 fi
 
 # --- 3. Baseline calibration eval (only on first invocation) ---
-if [[ ! -f "$RUNS_DIR/baseline_math500.jsonl" ]]; then
+if [[ "$SKIP_BASELINE" != "1" ]] && [[ ! -f "$RUNS_DIR/baseline_math500.jsonl" ]]; then
   echo ">> Calibrating baseline (target ~83% on MATH-500)..."
   BASE_MODEL="$BASE_MODEL" RUNS_DIR="$RUNS_DIR" HF_HOME="$HF_HOME" DATA_DIR="$DATA_DIR" \
     bash scripts/02_baseline_eval.sh
@@ -54,7 +56,6 @@ fi
 
 # --- 4. PI loop ---
 CURRENT_BASE="$BASE_EXT"
-DATA_FILE="$DATA_DIR/dolci_${N}.jsonl"
 
 for t in $(seq 1 "$T"); do
   echo "================ PI round $t / $T ================"
@@ -63,9 +64,11 @@ for t in $(seq 1 "$T"); do
   PHASE_A_TRACES=""
   if [[ "$t" -ge 2 ]]; then
     # t>=2: generate teacher traces conditioned on (x, c) for the bottleneck SFT.
+    # Need a long prefix budget to include the verbal CoT.
     PHASE_A_TRACES="$RUNS_DIR/qwen3-4b-abs/pi${t}_phaseA_teacher_traces.jsonl"
     if [[ ! -f "$PHASE_A_TRACES" ]]; then
       BASE="$CURRENT_BASE" OUT="$PHASE_A_TRACES" DATA="$DATA_FILE" N="$N" USE_COT=true \
+        MAX_PREFIX_LEN=7800 MAX_MODEL_LEN=8192 \
         bash scripts/05_gen_traces.sh
     fi
   fi
@@ -84,7 +87,10 @@ for t in $(seq 1 "$T"); do
 
   PHASE_B_TRACES="$RUNS_DIR/qwen3-4b-abs/pi${t}_phaseB_teacher_traces.jsonl"
   if [[ ! -f "$PHASE_B_TRACES" ]]; then
+    # Distill teacher: prompt only, no CoT. Some Dolci user prompts are 1.5–2.5k tokens,
+    # so don't pin MAX_MODEL_LEN too tight.
     BASE="$PHASE_A_MERGED" OUT="$PHASE_B_TRACES" DATA="$DATA_FILE" N="$N" USE_COT=false \
+      MAX_PREFIX_LEN=3072 MAX_MODEL_LEN=4096 \
       bash scripts/05_gen_traces.sh
   fi
 

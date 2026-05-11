@@ -2,7 +2,8 @@
 data/*.jsonl
 runs/
 cache/
-
+runs_validation/
+hf_upload/
 # Model checkpoints + HF cache
 *.safetensors
 *.bin
