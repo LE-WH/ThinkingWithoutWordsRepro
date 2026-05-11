@@ -1,0 +1,31 @@
+# Local data + runs
+data/*.jsonl
+runs/
+cache/
+
+# Model checkpoints + HF cache
+*.safetensors
+*.bin
+*.pt
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+*.egg-info/
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Job logs
+*.out
+*.log
+nohup.out
+
+# But keep the small files we want to track
+!data/.gitkeep
+!runs/.gitkeep
