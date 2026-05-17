@@ -1,6 +1,7 @@
 # Local data + runs
 data/*.jsonl
 runs/
+runs_hf/
 cache/
 runs_validation/
 hf_upload/

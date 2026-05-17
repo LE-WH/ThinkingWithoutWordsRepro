@@ -1,9 +1,11 @@
 """Build training sequences for Abstract-CoT warm-up.
 
 Two phases:
-  - "bottleneck": packed sequence [X; C; Z̃; Y] with block attention mask
-                  where Y is blocked from attending to C.
-                  Loss is computed on positions in (Z̃ ∪ Y).
+  - "bottleneck": two-pass decomposition of the original block-attention bottleneck.
+      Pass 1 — [X; C; Z̃] standard causal, loss on Z̃.   (Z̃ learns to compress C)
+      Pass 2 — [X; Z̃; Y] standard causal, loss on Y.    (Y uses Z̃, never sees C)
+      Both passes use standard causal masks → FlashAttention-2 compatible.
+      Mathematically equivalent to the original single-pass with custom block mask.
   - "distill":    packed sequence [X; Z̃; Y] with standard causal mask.
                   Loss is computed on positions in (Z̃ ∪ Y).
 """
@@ -157,6 +159,80 @@ def build_distill_example(
     }
 
 
+def build_bottleneck_pass1(
+    tok: PreTrainedTokenizer,
+    user: str,
+    cot: str,
+    abs_trace_ids: List[int],
+    begin_id: int,
+    end_id: int,
+    max_len: int = 2048,
+) -> Dict[str, Any] | None:
+    """Pass 1 of two-pass bottleneck: [X; C; Z̃] with standard causal mask.
+
+    Loss on Z̃ only. Z̃ attends to full X+C, learning to compress CoT.
+    No custom mask → FlashAttention-2 compatible.
+    """
+    X = encode_user_prefix(tok, user)
+    C = tok(cot, add_special_tokens=False).input_ids
+    Z = [begin_id] + abs_trace_ids + [end_id]
+
+    total = len(X) + len(C) + len(Z)
+    if total > max_len:
+        budget_for_C = max_len - len(X) - len(Z)
+        if budget_for_C < 16:
+            return None
+        C = C[:budget_for_C]
+        total = len(X) + len(C) + len(Z)
+
+    input_ids = X + C + Z
+    zs = len(X) + len(C)
+    labels = [IGNORE] * zs + list(Z)
+    return {
+        "input_ids": input_ids,
+        "labels": labels,
+        "attn_mask_2d": None,
+        "lens": (len(X), len(C), len(Z), 0),
+    }
+
+
+def build_bottleneck_pass2(
+    tok: PreTrainedTokenizer,
+    user: str,
+    answer: str,
+    abs_trace_ids: List[int],
+    begin_id: int,
+    end_id: int,
+    max_len: int = 2048,
+) -> Dict[str, Any] | None:
+    """Pass 2 of two-pass bottleneck: [X; Z̃; Y] with standard causal mask.
+
+    Loss on Y only. Y attends to X and Z̃ but never sees C.
+    No custom mask → FlashAttention-2 compatible.
+    """
+    X = encode_user_prefix(tok, user)
+    Z = [begin_id] + abs_trace_ids + [end_id]
+    Y = tok("\n" + answer, add_special_tokens=False).input_ids + [tok.eos_token_id]
+
+    total = len(X) + len(Z) + len(Y)
+    if total > max_len:
+        keep = max_len - len(X) - len(Z) - 1
+        if keep < 16:
+            return None
+        Y = Y[:keep] + [tok.eos_token_id]
+        total = len(X) + len(Z) + len(Y)
+
+    input_ids = X + Z + Y
+    ys = len(X) + len(Z)
+    labels = [IGNORE] * ys + list(Y)
+    return {
+        "input_ids": input_ids,
+        "labels": labels,
+        "attn_mask_2d": None,
+        "lens": (len(X), 0, len(Z), len(Y)),
+    }
+
+
 def collate(batch: List[Dict[str, Any]], pad_id: int):
     """Pad to longest in batch; build 4-D additive attention mask.
 
@@ -183,3 +259,15 @@ def collate(batch: List[Dict[str, Any]], pad_id: int):
         # Pad rows (i.e., positions ≥ L) keep -inf everywhere -> they will be ignored
         # because labels are -100 there.
     return {"input_ids": input_ids, "labels": labels, "attention_mask": add_mask}
+
+
+def collate_twopass(batch: List[Dict[str, Any]], pad_id: int):
+    """Collator for two-pass bottleneck mode.
+
+    Each item in batch is {"pass1": example, "pass2": example}.
+    Returns (batch1, batch2) where each is a standard collated dict.
+    """
+    return (
+        collate([item["pass1"] for item in batch], pad_id),
+        collate([item["pass2"] for item in batch], pad_id),
+    )

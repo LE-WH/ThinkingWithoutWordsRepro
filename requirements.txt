@@ -1,9 +1,10 @@
-# Pinned to versions verified on torch 2.11.0+cu130 / Python 3.14 / Ubuntu 24.04.
-# torch + CUDA come from the system / base image — do not list here.
+# Training dependencies — verified on torch 2.9.1+cu128 / Python 3.12 / Ubuntu 24.04.
+# torch, cuda runtime, and vllm are installed explicitly by scripts/setup.sh.
+# Do NOT add torch or vllm here.
 
 transformers>=4.51,<6
 accelerate>=1.13,<2
-datasets>=2.20,<5
+datasets>=2.20,<6
 peft>=0.19,<1
 huggingface_hub>=0.27
 sentencepiece
@@ -11,12 +12,8 @@ protobuf
 einops
 math_verify
 
-# Inference (eval + optional gen_traces port)
-vllm>=0.20,<1
-
-# Full-FT path (optional; CPU-Adam offload may fail to build on some
-# torch+CUDA combos — see docs/SMOKE_REPORT.md).
-deepspeed>=0.19,<1
+# Full-FT path (optional; ZeRO-3 offload)
+deepspeed>=0.15,<1
 
 # Utilities
 tqdm

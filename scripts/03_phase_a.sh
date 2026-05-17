@@ -22,6 +22,13 @@ cd "$REPO"
 : "${LORA_ALPHA:=64}"
 : "${LOG_EVERY:=5}"
 : "${TRACES_FILE:=}"   # set for PI round t>=2
+# W&B + in-training eval (optional; leave empty to disable)
+: "${WANDB_PROJECT:=}"
+: "${WANDB_RUN_NAME:=}"
+: "${EVAL_DATA:=}"
+: "${EVAL_EVERY:=100}"
+: "${EVAL_N:=100}"
+: "${EVAL_M_MAX:=128}"
 
 : "${NPROC:=$(python3 -c "import os; v=os.environ.get('CUDA_VISIBLE_DEVICES',''); print(v.count(',')+1 if v else 1)")}"
 
@@ -29,9 +36,13 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export PYTHONUNBUFFERED=1
 
 EXTRA=()
-if [[ -n "$TRACES_FILE" ]]; then
-  EXTRA+=(--traces-file "$TRACES_FILE")
-fi
+[[ -n "$TRACES_FILE"    ]] && EXTRA+=(--traces-file "$TRACES_FILE")
+[[ -n "$WANDB_PROJECT"  ]] && EXTRA+=(--wandb-project "$WANDB_PROJECT")
+[[ -n "$WANDB_RUN_NAME" ]] && EXTRA+=(--wandb-run-name "$WANDB_RUN_NAME")
+[[ -n "$EVAL_DATA"      ]] && EXTRA+=(--eval-data "$EVAL_DATA" \
+                                       --eval-every "$EVAL_EVERY" \
+                                       --eval-n "$EVAL_N" \
+                                       --eval-m-max "$EVAL_M_MAX")
 
 echo "Phase A: base=$BASE  out=$OUT  data=$DATA  n=$N  ep=$EPOCHS  nproc=$NPROC"
 accelerate launch --num_processes "$NPROC" --mixed_precision bf16 \

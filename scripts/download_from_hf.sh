@@ -28,19 +28,19 @@ case "$MODE" in
   --adapters-only)
     echo ">> Downloading LoRA adapters + logs + results (~11 GB) from $HF_REPO -> $OUT_DIR"
     hf download "$HF_REPO" \
-      --include "adapters/**" "train_logs/**" "results/**" "docs/**" "README.md" \
+      --include "adapters/**" --include "train_logs/**" --include "results/**" --include "docs/**" --include "README.md" \
       --local-dir "$OUT_DIR"
     ;;
   --intermediates)
     echo ">> Downloading final + round1 + round2 (~25 GB) from $HF_REPO -> $OUT_DIR"
     hf download "$HF_REPO" \
-      --include "final/**" "round1/**" "round2/**" "results/**" "train_logs/**" "docs/**" "README.md" \
+      --include "final/**" --include "round1/**" --include "round2/**" --include "results/**" --include "train_logs/**" --include "docs/**" --include "README.md" \
       --local-dir "$OUT_DIR"
     ;;
   default|*)
     echo ">> Downloading final model + results + logs + docs (~8.5 GB) from $HF_REPO -> $OUT_DIR"
     hf download "$HF_REPO" \
-      --include "final/**" "results/**" "train_logs/**" "docs/**" "README.md" \
+      --include "final/**" --include "results/**" --include "train_logs/**" --include "docs/**" --include "README.md" \
       --local-dir "$OUT_DIR"
     ;;
 esac
