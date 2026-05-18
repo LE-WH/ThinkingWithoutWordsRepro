@@ -5,10 +5,12 @@ runs_hf/
 cache/
 runs_validation/
 hf_upload/
+wandb/
 # Model checkpoints + HF cache
 *.safetensors
 *.bin
 *.pt
+
 
 # Python
 __pycache__/

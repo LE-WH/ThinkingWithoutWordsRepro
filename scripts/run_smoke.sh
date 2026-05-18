@@ -21,8 +21,16 @@ cd "$REPO"
 : "${HF_HOME:=$REPO/cache}"
 : "${DATA_FILE:=$DATA_DIR/dolci_${N}.jsonl}"   # override to share one download across N's
 : "${SKIP_BASELINE:=0}"
+: "${SAVE_EVERY:=20}"          # save LoRA adapter every N steps; 0 = off
+# Eval settings (for post-training batch eval with vLLM TP=n)
+: "${EVAL_DATA:=}"             # set to path/to/math500.jsonl to enable batch eval
+: "${EVAL_N:=500}"
+: "${WANDB_PROJECT:=}"
+: "${WANDB_RUN_ID:=}"
 : "${CUDA_VISIBLE_DEVICES:=$(bash scripts/check_gpus.sh)}"
 export HF_HOME CUDA_VISIBLE_DEVICES
+# Compute EVAL_TP after CUDA_VISIBLE_DEVICES is known
+: "${EVAL_TP:=$(echo "$CUDA_VISIBLE_DEVICES" | tr ',' '\n' | grep -c .)}"
 
 if [[ -z "$CUDA_VISIBLE_DEVICES" ]]; then
   echo "FATAL: no usable GPUs detected. Aborting." >&2
@@ -75,7 +83,7 @@ for t in $(seq 1 "$T"); do
 
   if [[ ! -d "$PHASE_A_OUT" ]]; then
     BASE="$CURRENT_BASE" OUT="$PHASE_A_OUT" DATA="$DATA_FILE" N="$N" EPOCHS="$EPOCHS" \
-      TRACES_FILE="$PHASE_A_TRACES" \
+      TRACES_FILE="$PHASE_A_TRACES" SAVE_EVERY="$SAVE_EVERY" \
       bash scripts/03_phase_a.sh
   fi
 
@@ -83,6 +91,20 @@ for t in $(seq 1 "$T"); do
   if [[ ! -d "$PHASE_A_MERGED" ]]; then
     BASE="$CURRENT_BASE" ADAPTER="$PHASE_A_OUT" OUT="$PHASE_A_MERGED" \
       bash scripts/04_merge_lora.sh
+  fi
+
+  # Batch eval of Phase A checkpoints (vLLM TP=n, runs post-training)
+  if [[ -n "$EVAL_DATA" ]]; then
+    echo ">> Batch eval: Phase A (pi${t})"
+    python3 src/eval_checkpoints.py \
+      --base "$CURRENT_BASE" \
+      --out  "$PHASE_A_OUT" \
+      --data "$EVAL_DATA" \
+      --n    "$EVAL_N" \
+      --tp   "$EVAL_TP" \
+      --phase "pi${t}_phaseA" \
+      ${WANDB_PROJECT:+--wandb-project "$WANDB_PROJECT"} \
+      ${WANDB_RUN_ID:+--wandb-run-id   "$WANDB_RUN_ID"}
   fi
 
   PHASE_B_TRACES="$RUNS_DIR/qwen3-4b-abs/pi${t}_phaseB_teacher_traces.jsonl"
@@ -97,7 +119,7 @@ for t in $(seq 1 "$T"); do
   PHASE_B_OUT="$RUNS_DIR/qwen3-4b-abs/pi${t}_phaseB"
   if [[ ! -d "$PHASE_B_OUT" ]]; then
     BASE="$PHASE_A_MERGED" TRACES_FILE="$PHASE_B_TRACES" OUT="$PHASE_B_OUT" \
-      DATA="$DATA_FILE" N="$N" EPOCHS="$EPOCHS" \
+      DATA="$DATA_FILE" N="$N" EPOCHS="$EPOCHS" SAVE_EVERY="$SAVE_EVERY" \
       bash scripts/06_phase_b.sh
   fi
 
@@ -105,6 +127,20 @@ for t in $(seq 1 "$T"); do
   if [[ ! -d "$PHASE_B_MERGED" ]]; then
     BASE="$PHASE_A_MERGED" ADAPTER="$PHASE_B_OUT" OUT="$PHASE_B_MERGED" \
       bash scripts/04_merge_lora.sh
+  fi
+
+  # Batch eval of Phase B checkpoints (vLLM TP=n, runs post-training)
+  if [[ -n "$EVAL_DATA" ]]; then
+    echo ">> Batch eval: Phase B (pi${t})"
+    python3 src/eval_checkpoints.py \
+      --base "$PHASE_A_MERGED" \
+      --out  "$PHASE_B_OUT" \
+      --data "$EVAL_DATA" \
+      --n    "$EVAL_N" \
+      --tp   "$EVAL_TP" \
+      --phase "pi${t}_phaseB" \
+      ${WANDB_PROJECT:+--wandb-project "$WANDB_PROJECT"} \
+      ${WANDB_RUN_ID:+--wandb-run-id   "$WANDB_RUN_ID"}
   fi
 
   CURRENT_BASE="$PHASE_B_MERGED"

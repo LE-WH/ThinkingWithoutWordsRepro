@@ -29,6 +29,9 @@ cd "$REPO"
 : "${EVAL_EVERY:=100}"
 : "${EVAL_N:=100}"
 : "${EVAL_M_MAX:=128}"
+: "${EVAL_RESP_MAX:=512}"
+: "${EVAL_BACKEND:=hf}"
+: "${SAVE_EVERY:=0}"
 
 : "${NPROC:=$(python3 -c "import os; v=os.environ.get('CUDA_VISIBLE_DEVICES',''); print(v.count(',')+1 if v else 1)")}"
 
@@ -42,7 +45,9 @@ EXTRA=()
 [[ -n "$EVAL_DATA"      ]] && EXTRA+=(--eval-data "$EVAL_DATA" \
                                        --eval-every "$EVAL_EVERY" \
                                        --eval-n "$EVAL_N" \
-                                       --eval-m-max "$EVAL_M_MAX")
+                                       --eval-m-max "$EVAL_M_MAX" \
+                                       --eval-resp-max "$EVAL_RESP_MAX" \
+                                       --eval-backend "$EVAL_BACKEND")
 
 echo "Phase A: base=$BASE  out=$OUT  data=$DATA  n=$N  ep=$EPOCHS  nproc=$NPROC"
 accelerate launch --num_processes "$NPROC" --mixed_precision bf16 \
@@ -53,5 +58,6 @@ accelerate launch --num_processes "$NPROC" --mixed_precision bf16 \
   --max-len "$MAX_LEN" \
   --lora-rank "$LORA_RANK" --lora-alpha "$LORA_ALPHA" \
   --log-every "$LOG_EVERY" \
+  --save-every "$SAVE_EVERY" \
   --out "$OUT" \
   "${EXTRA[@]}"

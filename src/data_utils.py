@@ -234,30 +234,39 @@ def build_bottleneck_pass2(
 
 
 def collate(batch: List[Dict[str, Any]], pad_id: int):
-    """Pad to longest in batch; build 4-D additive attention mask.
+    """Pad to longest in batch; build attention mask.
 
-    Returns:
-      input_ids: (B, T)
-      labels:    (B, T)
-      attention_mask: (B, 1, T, T) float, 0 = attend, -inf = mask (additive)
+    When all examples use standard causal masking (attn_mask_2d is None), returns
+    a 2-D padding mask [B, T] (1 = valid token, 0 = padding).  FA2 handles causal
+    masking internally via is_causal; passing a 4-D additive mask causes FA2's
+    _upad_input to misinterpret -inf entries as non-padding and OOM on 8k sequences.
+
+    When any example has a custom block mask, falls back to a 4-D additive mask
+    [B, 1, T, T] (0 = attend, -inf = block) for SDPA.
     """
     B = len(batch)
     T = max(len(b["input_ids"]) for b in batch)
     input_ids = torch.full((B, T), pad_id, dtype=torch.long)
     labels = torch.full((B, T), IGNORE, dtype=torch.long)
+    has_custom = any(b["attn_mask_2d"] is not None for b in batch)
+
+    if not has_custom:
+        padding_mask = torch.zeros((B, T), dtype=torch.long)
+        for i, b in enumerate(batch):
+            L = len(b["input_ids"])
+            input_ids[i, :L] = torch.tensor(b["input_ids"], dtype=torch.long)
+            labels[i, :L] = torch.tensor(b["labels"], dtype=torch.long)
+            padding_mask[i, :L] = 1
+        return {"input_ids": input_ids, "labels": labels, "attention_mask": padding_mask}
+
     add_mask = torch.full((B, 1, T, T), float("-inf"), dtype=torch.bfloat16)
     for i, b in enumerate(batch):
         L = len(b["input_ids"])
         input_ids[i, :L] = torch.tensor(b["input_ids"], dtype=torch.long)
         labels[i, :L] = torch.tensor(b["labels"], dtype=torch.long)
-        if b["attn_mask_2d"] is not None:
-            m = b["attn_mask_2d"]
-        else:
-            m = torch.tril(torch.ones(L, L, dtype=torch.bool))
+        m = b["attn_mask_2d"]  # guaranteed not None in this branch
         m_f = torch.where(m, 0.0, float("-inf")).to(torch.bfloat16)
         add_mask[i, 0, :L, :L] = m_f
-        # Pad rows (i.e., positions ≥ L) keep -inf everywhere -> they will be ignored
-        # because labels are -100 there.
     return {"input_ids": input_ids, "labels": labels, "attention_mask": add_mask}
 
 
